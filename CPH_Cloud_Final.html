@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CPH Boucle de Seine — Trombinoscope ☁️</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+<!-- ══ FIREBASE SDK ══ -->
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+  import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, getDoc } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+  import { getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js';
+
+  // ══════════════════════════════════════════════════
+  // 🔧 CONFIGURATION FIREBASE — À REMPLIR UNE SEULE FOIS
+  // ══════════════════════════════════════════════════
+  const firebaseConfig = {
+    apiKey: "AIzaSyDxr-01jg2yV-AK8GSTh-1GTpbgJU0Q-Hs",
+    authDomain: "appartements-cph.firebaseapp.com",
+    projectId: "appartements-cph",
+    storageBucket: "appartements-cph.firebasestorage.app",
+    messagingSenderId: "1021975326044",
+    appId: "1:1021975326044:web:b06d01ce8b61756e666599"
+  };
+  // ══════════════════════════════════════════════════
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
+  const storage = getStorage(app);
+
+  const TARGET_CAP = 160;
+  const TYPES = {
+    H:{lbl:"Hommes",ico:"👨",cls:"type-H"},
+    F:{lbl:"Femmes",ico:"👩",cls:"type-F"},
+    M:{lbl:"Familles",ico:"👨‍👩‍👧",cls:"type-M"}
+  };
+
+  let houses = [];
+  let persons = [];
+  let curView = 'trombi';
+  let editPid = null, editHid = null, pendingPhoto = "", avTarget = null;
+
+  // ══ FIRESTORE LISTENERS — TEMPS RÉEL ══
+  function startListeners() {
+    // Logements
+    onSnapshot(collection(db, 'houses'), snap => {
+      houses = snap.docs.map(d => ({id: d.id, ...d.data()}));
+      houses.sort((a,b) => String(a.id).localeCompare(String(b.id)));
+      render();
+      showSyncBadge('✅ Synchro');
+    });
+
+    // Résidents
+    onSnapshot(collection(db, 'persons'), snap => {
+      persons = snap.docs.map(d => ({id: d.id, ...d.data()}));
+      render();
+    });
+  }
+
+  // ══ CRUD LOGEMENTS ══
+  window.saveHouse = async function() {
+    const addr  = document.getElementById('h-addr').value.trim();
+    const city  = document.getElementById('h-city').value.trim();
+    const type  = document.getElementById('h-type').value;
+    const rooms = parseInt(document.getElementById('h-rooms').value) || 1;
+    const cap   = parseInt(document.getElementById('h-cap').value) || 1;
+    if (!addr) { alert('Adresse obligatoire'); return; }
+
+    const id = editHid || 'h_' + Date.now();
+    await setDoc(doc(db, 'houses', String(id)), { addr, city: city||'Sartrouville', type, rooms, cap });
+    closeModal('modal-h');
+    showSyncBadge('✅ Logement sauvegardé');
+  };
+
+  window.deleteHouse = async function() {
+    if (!editHid) return;
+    if (!confirm('Supprimer ce logement et tous ses résidents ?')) return;
+    const toDelete = persons.filter(p => p.hid === editHid);
+    for (const p of toDelete) await deleteDoc(doc(db, 'persons', String(p.id)));
+    await deleteDoc(doc(db, 'houses', String(editHid)));
+    closeModal('modal-h');
+  };
+
+  window.deleteHouseConfirm = async function(hid) {
+    if (!confirm('Supprimer ce logement et tous ses résidents ?')) return;
+    const toDelete = persons.filter(p => p.hid === hid);
+    for (const p of toDelete) await deleteDoc(doc(db, 'persons', String(p.id)));
+    await deleteDoc(doc(db, 'houses', String(hid)));
+  };
+
+  // ══ CRUD RÉSIDENTS ══
+  window.savePerson = async function() {
+    const name  = document.getElementById('p-name').value.trim();
+    const role  = document.getElementById('p-role').value;
+    const age   = parseInt(document.getElementById('p-age').value) || 0;
+    const nat   = document.getElementById('p-nat').value.trim();
+    const hid   = document.getElementById('p-hid').value;
+    const entry = document.getElementById('p-entry').value;
+    const exit  = document.getElementById('p-exit').value;
+    if (!name) { alert('Nom obligatoire'); return; }
+    if (!hid)  { alert('Logement obligatoire'); return; }
+
+    const id = editPid || 'p_' + Date.now();
+    let photoURL = '';
+
+    // Upload photo si nouvelle
+    if (pendingPhoto) {
+      try {
+        showSyncBadge('📤 Upload photo…');
+        const imgRef = storageRef(storage, `photos/${id}`);
+        await uploadString(imgRef, pendingPhoto, 'data_url');
+        photoURL = await getDownloadURL(imgRef);
+      } catch(e) {
+        console.error('Photo upload failed:', e);
+        // Fallback: store as base64 in Firestore (small images only)
+        photoURL = pendingPhoto.length < 500000 ? pendingPhoto : '';
+      }
+    } else if (editPid) {
+      const existing = persons.find(p => p.id === editPid);
+      photoURL = existing ? (existing.photo || '') : '';
+    }
+
+    await setDoc(doc(db, 'persons', String(id)), {
+      name, role, age, nat, hid, entry, exit, photo: photoURL
+    });
+    pendingPhoto = '';
+    closeModal('modal-p');
+    showSyncBadge('✅ Résident sauvegardé');
+  };
+
+  window.deletePerson = async function() {
+    if (!editPid) return;
+    if (!confirm('Supprimer ce résident ?')) return;
+    await deleteDoc(doc(db, 'persons', String(editPid)));
+    closeModal('modal-p');
+  };
+
+  // ══ DRAG & DROP ══
+  window.dropPerson = async function(pid, newHid) {
+    const p = persons.find(x => x.id === pid);
+    if (p && p.hid !== newHid) {
+      await setDoc(doc(db, 'persons', String(pid)), {...p, hid: newHid});
+    }
+  };
+
+  // ══ INLINE HOUSE EDIT ══
+  window.adjInlineCap = function(hid, d) {
+    const h = houses.find(x => x.id === hid); if (!h) return;
+    h.cap = Math.max(1, h.cap + d);
+    const el = document.getElementById('hi-cap-' + hid);
+    if (el) el.textContent = h.cap;
+  };
+
+  window.saveHouseInline = async function(hid) {
+    const h = houses.find(x => x.id === hid); if (!h) return;
+    const addr = document.getElementById('hi-addr-' + hid)?.value.trim();
+    const type = document.getElementById('hi-type-' + hid)?.value;
+    if (addr) h.addr = addr;
+    if (type) h.type = type;
+    await setDoc(doc(db, 'houses', String(hid)), h);
+    toggleHouseEdit(hid);
+    showSyncBadge('✅ Sauvegardé');
+  };
+
+  window.toggleHouseEdit = function(hid) {
+    const el = document.getElementById('hedit-' + hid);
+    if (!el) return;
+    el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  };
+
+  // ══ PHOTO ══
+  window.handlePhoto = function(input) {
+    const f = input.files[0]; if (!f) return;
+    const r = new FileReader();
+    r.onload = e => {
+      pendingPhoto = e.target.result;
+      document.getElementById('pz-img').src = pendingPhoto;
+      document.getElementById('pz-img').style.display = 'block';
+      document.getElementById('pz-ph').style.display = 'none';
+    };
+    r.readAsDataURL(f);
+  };
+
+  // ══ MODALS ══
+  window.openAddHouse = function() {
+    editHid = null;
+    document.getElementById('mh-title').textContent = 'Nouveau logement';
+    document.getElementById('mh-del').style.display = 'none';
+    document.getElementById('h-addr').value = '';
+    document.getElementById('h-city').value = '';
+    document.getElementById('h-type').value = 'H';
+    document.getElementById('h-rooms').value = '2';
+    document.getElementById('h-cap').value = '4';
+    openModal('modal-h');
+  };
+
+  window.openEditHouse = function(hid) {
+    editHid = hid;
+    const h = houses.find(x => x.id === hid); if (!h) return;
+    document.getElementById('mh-title').textContent = 'Modifier logement';
+    document.getElementById('mh-del').style.display = 'inline-flex';
+    document.getElementById('h-addr').value = h.addr || '';
+    document.getElementById('h-city').value = h.city || '';
+    document.getElementById('h-type').value = h.type || 'H';
+    document.getElementById('h-rooms').value = h.rooms || 2;
+    document.getElementById('h-cap').value = h.cap || 4;
+    openModal('modal-h');
+  };
+
+  window.openAddPerson = function(hid) {
+    editPid = null; pendingPhoto = '';
+    document.getElementById('mp-title').textContent = 'Nouveau résident';
+    document.getElementById('mp-del').style.display = 'none';
+    document.getElementById('p-name').value = '';
+    document.getElementById('p-role').value = 'Résident';
+    document.getElementById('p-age').value = '';
+    document.getElementById('p-nat').value = '';
+    document.getElementById('p-hid').value = hid || '';
+    document.getElementById('p-entry').value = new Date().toISOString().slice(0,10);
+    document.getElementById('p-exit').value = '';
+    document.getElementById('pz-img').style.display = 'none';
+    document.getElementById('pz-ph').style.display = 'block';
+    fillHidOptions();
+    openModal('modal-p');
+  };
+
+  window.openEditPerson = function(pid) {
+    editPid = pid; pendingPhoto = '';
+    const p = persons.find(x => x.id === pid); if (!p) return;
+    document.getElementById('mp-title').textContent = 'Modifier résident';
+    document.getElementById('mp-del').style.display = 'inline-flex';
+    document.getElementById('p-name').value = p.name || '';
+    document.getElementById('p-role').value = p.role || 'Résident';
+    document.getElementById('p-age').value = p.age || '';
+    document.getElementById('p-nat').value = p.nat || '';
+    document.getElementById('p-hid').value = p.hid || '';
+    document.getElementById('p-entry').value = p.entry || '';
+    document.getElementById('p-exit').value = p.exit || '';
+    if (p.photo) {
+      document.getElementById('pz-img').src = p.photo;
+      document.getElementById('pz-img').style.display = 'block';
+      document.getElementById('pz-ph').style.display = 'none';
+    } else {
+      document.getElementById('pz-img').style.display = 'none';
+      document.getElementById('pz-ph').style.display = 'block';
+    }
+    fillHidOptions();
+    openModal('modal-p');
+  };
+
+  function fillHidOptions() {
+    const sel = document.getElementById('p-hid');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— Choisir logement —</option>' +
+      houses.map(h => `<option value="${h.id}" ${h.id==cur?'selected':''}>${h.addr.slice(0,45)}</option>`).join('');
+    if (cur) sel.value = cur;
+  }
+
+  window.openModal = function(id) { document.getElementById(id).style.display='flex'; };
+  window.closeModal = function(id) { document.getElementById(id).style.display='none'; };
+
+  window.adjCap = function(d) {
+    const el = document.getElementById('h-cap');
+    el.value = Math.max(1, parseInt(el.value)||1)+d;
+    updateCapInfo();
+  };
+
+  function updateCapInfo() {
+    const cap = parseInt(document.getElementById('h-cap').value)||0;
+    const total = houses.reduce((a,h)=>a+h.cap,0) + (editHid ? cap - (houses.find(h=>h.id===editHid)?.cap||0) : cap);
+    const diff = total - TARGET_CAP;
+    const el = document.getElementById('h-cap-total');
+    if (el) el.textContent = `Total : ${total} / ${TARGET_CAP} (${diff>=0?'+'+diff:diff} ${diff>0?'au-dessus':'en-dessous'})`;
+  }
+
+  // ══ SYNC BADGE ══
+  function showSyncBadge(msg) {
+    const el = document.getElementById('sync-badge');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(window._syncTimer);
+    window._syncTimer = setTimeout(() => { el.style.opacity = '0'; }, 3000);
+  }
+
+  // ══ HELPERS ══
+  function active(p) {
+    const t = new Date().toISOString().slice(0,10);
+    return !p.exit || p.exit === '' || p.exit >= t;
+  }
+  function ini(n) { return (n||'').split(' ').slice(0,2).map(w=>w[0]||'').join('').toUpperCase(); }
+  function fmtD(d) { if(!d) return '—'; const[y,m,dd]=d.split('-'); return `${dd}/${m}/${y}`; }
+  function typeBadge(t) { const d=TYPES[t]||TYPES.H; return `<span class="type-badge ${d.cls}">${d.ico} ${d.lbl}</span>`; }
+
+  // ══ STATS ══
+  function updateStats() {
+    const cap  = houses.reduce((a,h)=>a+h.cap,0);
+    const occ  = persons.filter(p=>active(p)).length;
+    const avail = Math.max(0,cap-occ);
+    const pct  = Math.min(100, Math.round(cap/TARGET_CAP*100));
+    const setTxt = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=v; };
+    setTxt('s-houses', houses.length);
+    setTxt('s-cap', cap);
+    setTxt('s-occ', occ);
+    setTxt('s-avail', avail);
+    const bar = document.getElementById('s-cap-bar');
+    if (bar) { bar.style.width=pct+'%'; bar.className='cap-fill'+(pct>=100?' cap-warn':''); }
+    setTxt('s-h', houses.filter(h=>h.type==='H').reduce((a,h)=>a+persons.filter(p=>p.hid===h.id&&active(p)).length,0));
+    setTxt('s-f', houses.filter(h=>h.type==='F').reduce((a,h)=>a+persons.filter(p=>p.hid===h.id&&active(p)).length,0));
+    setTxt('s-m', houses.filter(h=>h.type==='M').reduce((a,h)=>a+persons.filter(p=>p.hid===h.id&&active(p)).length,0));
+    setTxt('s-mineurs', persons.filter(p=>active(p)&&p.age>0&&p.age<18).length);
+    setTxt('s-seniors', persons.filter(p=>active(p)&&p.age>64).length);
+    const withAge = persons.filter(p=>active(p)&&p.age>0);
+    const ageMoy = withAge.length ? Math.round(withAge.reduce((a,p)=>a+p.age,0)/withAge.length) : 0;
+    setTxt('s-agemoy', ageMoy ? ageMoy+' ans' : '—');
+    const natCount = {};
+    persons.filter(p=>active(p)&&p.nat).forEach(p=>{ const n=p.nat.trim(); natCount[n]=(natCount[n]||0)+1; });
+    const topNats = Object.entries(natCount).sort((a,b)=>b[1]-a[1]).slice(0,6);
+    const natColors = ['#1B2A4A','#2A7F7F','#7C3AED','#D97706','#DC2626','#16A34A'];
+    const natEl = document.getElementById('s-nats');
+    if (natEl) natEl.innerHTML = topNats.map(([nat,count],i)=>
+      `<div style="display:flex;align-items:center;gap:6px;background:${natColors[i]||'#64748B'}18;border:1.5px solid ${natColors[i]||'#64748B'}33;border-radius:20px;padding:4px 12px">
+        <span style="font-size:13px;font-weight:800;color:${natColors[i]||'#64748B'}">${count}</span>
+        <span style="font-size:11px;font-weight:600;color:var(--text)">${nat}</span>
+      </div>`
+    ).join('');
+  }
+
+  // ══ RENDER TROMBI ══
+  function renderTrombi(q, fs, ft) {
+    const el = document.getElementById('view-trombi');
+    el.innerHTML = '';
+    const searchFree = q && ('libre'.includes(q)||'disponible'.includes(q)||'place'.includes(q));
+    const cityOrder = ['Sartrouville','Montesson','Chatou','Port Marly','Marly-le-Roi','La Celle St Cloud','Le Chesnay','Rambouillet'];
+    const cityColors = {'Sartrouville':'#1B2A4A','Montesson':'#2E6B4A','Chatou':'#4A2E6B','Port Marly':'#6B4A2E','Marly-le-Roi':'#2E4A6B','La Celle St Cloud':'#6B2E4A','Le Chesnay':'#2E6B6B','Rambouillet':'#4A4A2E'};
+
+    // Rassembler toutes les villes
+    const allCities = [...new Set(houses.map(h=>h.city||'Sartrouville'))];
+    const orderedCities = [...cityOrder.filter(c=>allCities.includes(c)), ...allCities.filter(c=>!cityOrder.includes(c))];
+
+    orderedCities.forEach(city => {
+      const cityHouses = houses.filter(h=>(h.city||'Sartrouville')===city&&(!ft||h.type===ft));
+      if (!cityHouses.length) return;
+      let hasVisible = false;
+      cityHouses.forEach(h => {
+        const occ = persons.filter(p=>p.hid===h.id&&active(p)).length;
+        const avail = Math.max(0,h.cap-occ);
+        const hps = persons.filter(p=>p.hid===h.id&&(fs!=='active'||active(p))&&(fs!=='out'||!active(p)));
+        const addrMatch = q&&h.addr.toLowerCase().includes(q);
+        const resMatch = hps.some(p=>p.name.toLowerCase().includes(q)||(p.nat||'').toLowerCase().includes(q));
+        const freeMatch = searchFree&&avail>0;
+        if (!q||addrMatch||resMatch||freeMatch) hasVisible = true;
+      });
+      if (!hasVisible) return;
+
+      const cityHdr = document.createElement('div');
+      cityHdr.style.cssText = 'margin-top:24px;margin-bottom:4px;display:flex;align-items:center;gap:10px';
+      const cityStats = cityHouses.reduce((a,h)=>{
+        const occ=persons.filter(p=>p.hid===h.id&&active(p)).length;
+        return{cap:a.cap+h.cap,occ:a.occ+occ,avail:a.avail+Math.max(0,h.cap-occ)};
+      },{cap:0,occ:0,avail:0});
+      const cc = cityColors[city]||'#1B2A4A';
+      cityHdr.innerHTML = `
+        <div style="flex:1;height:2px;background:${cc};border-radius:1px"></div>
+        <div style="background:${cc};color:#fff;padding:5px 14px;border-radius:20px;font-size:12px;font-weight:800;white-space:nowrap">📍 ${city}</div>
+        <div style="font-size:11px;color:var(--slate);font-weight:600;white-space:nowrap">
+          ${cityHouses.length} logement${cityHouses.length>1?'s':''} · ${cityStats.occ}/${cityStats.cap} résidents · <span style="color:${cityStats.avail>0?'#27AE60':'#94a3b8'}">${cityStats.avail} libre${cityStats.avail!==1?'s':''}</span>
+        </div>
+        <div style="flex:1;height:2px;background:${cc};border-radius:1px"></div>`;
+      el.appendChild(cityHdr);
+
+      cityHouses.forEach(h => {
+        const occ = persons.filter(p=>p.hid===h.id&&active(p)).length;
+        const avail = Math.max(0,h.cap-occ);
+        const hps = persons.filter(p=>{
+          if(p.hid!==h.id) return false;
+          if(fs==='active'&&!active(p)) return false;
+          if(fs==='out'&&active(p)) return false;
+          if(fs==='mineur'&&!(p.age>0&&p.age<18)) return false;
+          if(fs==='senior'&&!(p.age>64)) return false;
+          if(q&&!(p.name.toLowerCase().includes(q)||(p.nat||'').toLowerCase().includes(q)||h.addr.toLowerCase().includes(q))) return false;
+          return true;
+        });
+        const addrMatch = q&&h.addr.toLowerCase().includes(q);
+        const freeMatch = searchFree&&avail>0;
+        if(q&&hps.length===0&&!addrMatch&&!freeMatch) return;
+
+        const blk = document.createElement('div');
+        blk.className = 'house-block';
+        blk.innerHTML = `
+          <div class="house-block-hdr" style="cursor:pointer" onclick="toggleHouseEdit('${h.id}')">
+            <span style="font-size:18px;flex-shrink:0">🏠</span>
+            <div class="hb-addr">${h.addr}</div>
+            <div class="hb-right">
+              ${typeBadge(h.type)}
+              <div class="hb-num"><span class="dot dot-g"></span>${h.cap}</div>
+              <div class="hb-num"><span class="dot dot-r"></span>${occ}</div>
+              <div class="hb-num" style="color:${avail>0?'#27AE60':'#94a3b8'};font-weight:800">${avail} libre${avail!==1?'s':''}</div>
+              <span style="font-size:11px;opacity:.6;margin-left:4px">✏️</span>
+            </div>
+          </div>
+          <div class="house-inline-edit" id="hedit-${h.id}" style="display:none;padding:12px 16px;background:#f8fafc;border-bottom:1px solid var(--border)">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+              <div style="flex:2;min-width:180px">
+                <div class="fl" style="margin-bottom:4px">Adresse</div>
+                <input class="fi" id="hi-addr-${h.id}" value="${h.addr.replace(/"/g,'&quot;')}" style="font-size:12px">
+              </div>
+              <div style="min-width:110px">
+                <div class="fl" style="margin-bottom:4px">Type</div>
+                <select class="fi" id="hi-type-${h.id}" style="font-size:12px">
+                  <option value="H" ${h.type==='H'?'selected':''}>👨 Hommes</option>
+                  <option value="F" ${h.type==='F'?'selected':''}>👩 Femmes</option>
+                  <option value="M" ${h.type==='M'?'selected':''}>👨‍👩‍👧 Familles</option>
+                </select>
+              </div>
+              <div style="min-width:120px">
+                <div class="fl" style="margin-bottom:4px">Places</div>
+                <div style="display:flex;align-items:center;gap:6px">
+                  <button class="btn btn-cancel btn-sm btn-icon" onclick="adjInlineCap('${h.id}',-1)">−</button>
+                  <span id="hi-cap-${h.id}" style="font-size:16px;font-weight:800;min-width:24px;text-align:center">${h.cap}</span>
+                  <button class="btn btn-primary btn-sm btn-icon" onclick="adjInlineCap('${h.id}',1)">+</button>
+                </div>
+              </div>
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-primary btn-sm" onclick="saveHouseInline('${h.id}')">✅ Enregistrer</button>
+                <button class="btn btn-cancel btn-sm" onclick="toggleHouseEdit('${h.id}')">✖</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteHouseConfirm('${h.id}')">🗑</button>
+              </div>
+            </div>
+          </div>
+          <div class="trombi-grid" id="tg-${h.id}"></div>`;
+
+        // Drag & drop
+        const grid = blk.querySelector(`#tg-${h.id}`);
+        grid.addEventListener('dragover', e=>{ e.preventDefault(); grid.style.outline='2px dashed var(--teal)'; });
+        grid.addEventListener('dragleave', ()=>{ grid.style.outline=''; });
+        grid.addEventListener('drop', e=>{
+          e.preventDefault(); grid.style.outline='';
+          const pid = e.dataTransfer.getData('pid');
+          dropPerson(pid, h.id);
+        });
+        el.appendChild(blk);
+
+        // Residents
+        hps.forEach(p => {
+          const act = active(p);
+          const c = document.createElement('div');
+          c.className = 'pc' + (act?'':' out');
+          c.draggable = true;
+          c.addEventListener('dragstart', e=>{ e.dataTransfer.setData('pid', p.id); });
+          c.onclick = () => openEditPerson(p.id);
+          const photoHTML = p.photo
+            ? `<img src="${p.photo}" style="width:56px;height:56px;border-radius:50%;object-fit:cover;display:block;margin:0 auto 4px" onerror="this.style.display='none'">`
+            : `<div class="pc-av">${ini(p.name)}</div>`;
+          c.innerHTML = `
+            ${photoHTML}
+            <div class="pc-name">${p.name}</div>
+            <div class="pc-meta">${p.nat||''}</div>
+            <div class="pc-meta">${p.age?p.age+' ans':''}</div>
+            ${!act?'<div class="pc-out-badge">Sorti</div>':''}`;
+          grid.appendChild(c);
+        });
+
+        // Bouton ajouter résident
+        const addBtn = document.createElement('div');
+        addBtn.className = 'pc-add';
+        addBtn.innerHTML = `<div style="font-size:22px;opacity:.3">+</div><div style="font-size:10px;opacity:.4">Résident</div>`;
+        addBtn.onclick = () => openAddPerson(h.id);
+        grid.appendChild(addBtn);
+      });
+    });
+  }
+
+  // ══ RENDER LOGEMENTS ══
+  function renderLogements(q, fs, ft) {
+    const el = document.getElementById('view-logements');
+    el.innerHTML = '';
+    let filtered = houses.filter(h=>{
+      if(ft&&h.type!==ft) return false;
+      if(q&&!h.addr.toLowerCase().includes(q)&&!(h.city||'').toLowerCase().includes(q)) return false;
+      return true;
+    });
+    filtered.forEach(h=>{
+      const occ = persons.filter(p=>p.hid===h.id&&active(p)).length;
+      const avail = Math.max(0,h.cap-occ);
+      const pct = Math.round(occ/Math.max(1,h.cap)*100);
+      const row = document.createElement('div');
+      row.className='log-row';
+      row.innerHTML=`
+        <div class="log-addr">
+          <span style="font-size:16px">🏠</span>
+          <div>
+            <div style="font-weight:700;font-size:13px">${h.addr}</div>
+            <div style="font-size:11px;color:var(--slate)">${h.city||''} · ${h.rooms||1} ch.</div>
+          </div>
+        </div>
+        <div>${typeBadge(h.type)}</div>
+        <div class="log-bar-wrap">
+          <div class="log-bar-fill" style="width:${pct}%;background:${pct>=100?'var(--red)':'var(--teal)'}"></div>
+        </div>
+        <div style="font-size:12px;font-weight:700">${occ}/${h.cap}</div>
+        <div style="font-size:12px;color:${avail>0?'#27AE60':'#94a3b8'};font-weight:700">${avail} libre${avail!==1?'s':''}</div>
+        <button class="btn btn-ghost btn-sm" onclick="openEditHouse('${h.id}')" style="background:var(--teal-l);color:var(--teal)">✏️ Modifier</button>`;
+      el.appendChild(row);
+    });
+  }
+
+  // ══ RENDER PRINCIPAL ══
+  window.render = function() {
+    const q  = (document.getElementById('search')?.value||'').toLowerCase();
+    const fs = document.getElementById('f-status')?.value || '';
+    const ft = document.getElementById('f-type')?.value || '';
+    updateStats();
+    if (curView==='trombi') renderTrombi(q,fs,ft);
+    else renderLogements(q,fs,ft);
+  };
+
+  window.switchView = function(v) {
+    curView = v;
+    ['trombi','logements'].forEach(x=>{
+      document.getElementById('tab-'+x)?.classList.toggle('active',x===v);
+      const ve = document.getElementById('view-'+x);
+      if(ve) ve.style.display = x===v?'block':'none';
+    });
+    render();
+  };
+
+  // ══ IMPORT DONNÉES EXISTANTES ══
+  window.importFromJSON = async function(input) {
+    const f = input.files[0]; if(!f) return;
+    const r = new FileReader();
+    r.onload = async e=>{
+      try{
+        const data = JSON.parse(e.target.result);
+        if(!data.houses||!data.persons) throw new Error('Format invalide');
+        if(!confirm(`Importer ${data.houses.length} logements et ${data.persons.length} résidents dans Firebase?\nCela FUSIONNERA avec les données existantes.`)) return;
+        showSyncBadge('⏳ Import en cours…');
+        let i=0;
+        for(const h of data.houses){
+          const id = String(h.id||'h_'+Date.now()+'_'+(i++));
+          await setDoc(doc(db,'houses',id),{
+            addr:h.addr||'',city:h.city||'Sartrouville',type:h.type||'H',
+            rooms:h.rooms||2,cap:h.cap||4
+          });
+        }
+        i=0;
+        for(const p of data.persons){
+          const id = String(p.id||'p_'+Date.now()+'_'+(i++));
+          await setDoc(doc(db,'persons',id),{
+            name:p.name||'',role:p.role||'Résident',age:p.age||0,
+            nat:p.nat||'',hid:String(p.hid||''),entry:p.entry||'',
+            exit:p.exit||'',photo:p.photo||''
+          });
+        }
+        showSyncBadge('✅ Import terminé !');
+      }catch(err){ alert('❌ Erreur: '+err.message); }
+    };
+    r.readAsText(f);
+  };
+
+  // ══ DÉMARRAGE ══
+  window.addEventListener('DOMContentLoaded', () => {
+    // Vérifier config Firebase
+    if (firebaseConfig.apiKey === 'VOTRE_API_KEY') {
+      document.getElementById('setup-banner').style.display = 'flex';
+    } else {
+      startListeners();
+    }
+  });
+
+</script>
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#1B2A4A;--navy2:#2E4A7A;--teal:#2A7F7F;--teal-l:#E6F4F4;
+  --green:#27AE60;--green-l:#EAFAF1;--red:#E05A52;--red-l:#FDEDEC;
+  --blue:#3B82F6;--blue-l:#EFF6FF;--purple:#7C3AED;--purple-l:#F5F3FF;
+  --amber:#D97706;--amber-l:#FFFBEB;--slate:#64748B;
+  --border:#DDE3EC;--light:#F0F4F8;--white:#fff;--text:#1E293B;
+}
+body{font-family:'Inter',sans-serif;background:var(--light);color:var(--text);min-height:100vh;font-size:14px}
+
+/* SETUP BANNER */
+#setup-banner{
+  display:none;position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,.85);align-items:center;justify-content:center;
+}
+.setup-box{
+  background:#fff;border-radius:20px;padding:36px 40px;max-width:620px;width:90%;
+  box-shadow:0 24px 80px rgba(0,0,0,.4);
+}
+.setup-box h2{font-size:22px;font-weight:800;color:var(--navy);margin-bottom:8px}
+.setup-box p{font-size:13px;color:var(--slate);margin-bottom:16px;line-height:1.6}
+.setup-step{
+  background:var(--light);border-radius:10px;padding:14px 16px;margin-bottom:10px;
+  border-left:3px solid var(--teal);font-size:13px;line-height:1.7;
+}
+.setup-step strong{color:var(--navy)}
+.setup-step code{
+  background:#1e293b;color:#7dd3fc;padding:2px 7px;border-radius:5px;
+  font-size:12px;font-family:monospace;
+}
+.setup-step a{color:var(--teal);font-weight:700}
+
+/* SYNC BADGE */
+#sync-badge{
+  position:fixed;bottom:20px;right:20px;z-index:500;
+  background:var(--navy);color:#fff;padding:8px 16px;border-radius:20px;
+  font-size:12px;font-weight:700;opacity:0;
+  transition:opacity .3s;pointer-events:none;
+  box-shadow:0 4px 20px rgba(0,0,0,.3);
+}
+#cloud-indicator{
+  display:inline-flex;align-items:center;gap:6px;
+  background:rgba(255,255,255,.15);border-radius:20px;
+  padding:4px 10px;font-size:11px;font-weight:700;
+}
+.cloud-dot{
+  width:8px;height:8px;border-radius:50%;background:#22c55e;
+  animation:pulse 2s infinite;
+}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* HEADER */
+.app-header{
+  background:var(--navy);color:#fff;padding:0 24px;height:64px;
+  display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:300;box-shadow:0 2px 16px rgba(0,0,0,.3);
+}
+.hdr-brand{display:flex;flex-direction:column;gap:1px}
+.hdr-brand h1{font-size:14px;font-weight:800;letter-spacing:.3px}
+.hdr-brand p{font-size:11px;opacity:.55;font-weight:400}
+.hdr-actions{display:flex;gap:8px;align-items:center}
+.btn{padding:7px 14px;border-radius:8px;border:none;cursor:pointer;font-size:12px;font-weight:700;font-family:inherit;transition:all .18s;display:inline-flex;align-items:center;gap:5px}
+.btn-primary{background:var(--teal);color:#fff}.btn-primary:hover{background:#236969}
+.btn-ghost{background:rgba(255,255,255,.1);color:#fff;border:1px solid rgba(255,255,255,.2)}.btn-ghost:hover{background:rgba(255,255,255,.18)}
+.btn-danger{background:#dc2626;color:#fff}.btn-danger:hover{background:#b91c1c}
+.btn-cancel{background:var(--border);color:var(--text)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.btn-icon{width:28px;height:28px;padding:0;border-radius:7px;font-size:14px;justify-content:center}
+
+/* TABS */
+.tabs{background:#fff;border-bottom:2px solid var(--border);display:flex;padding:0 24px;gap:2px}
+.tab{padding:13px 16px;font-size:12px;font-weight:700;color:var(--slate);cursor:pointer;border-bottom:2.5px solid transparent;margin-bottom:-2px;transition:all .15s;white-space:nowrap}
+.tab.active{color:var(--navy);border-bottom-color:var(--teal)}
+.tab:hover:not(.active){color:var(--navy)}
+
+/* STATS */
+.stats-row{padding:18px 24px 0;display:flex;gap:12px;flex-wrap:wrap}
+.stat-card{background:#fff;border-radius:12px;padding:14px 18px;display:flex;align-items:center;gap:12px;border:1px solid var(--border);flex:1;min-width:130px}
+.stat-ico{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
+.stat-val{font-size:22px;font-weight:800;line-height:1}
+.stat-lbl{font-size:10px;color:var(--slate);margin-top:2px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.cap-bar{height:4px;border-radius:2px;background:var(--border);margin-top:6px;overflow:hidden}
+.cap-fill{height:100%;border-radius:2px;background:var(--teal);transition:width .4s}
+.cap-warn{background:var(--red)}
+
+/* TOOLBAR */
+.toolbar{padding:14px 24px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.search-wrap{flex:1;min-width:200px;position:relative}
+.search-wrap input{width:100%;padding:9px 13px 9px 36px;border:1.5px solid var(--border);border-radius:10px;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s;background:#fff}
+.search-wrap input:focus{border-color:var(--teal)}
+.search-ico{position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:14px;color:var(--slate)}
+.sel{padding:9px 12px;border:1.5px solid var(--border);border-radius:10px;font-size:12px;font-family:inherit;outline:none;background:#fff;cursor:pointer;color:var(--text);font-weight:600}
+
+/* TYPE BADGES */
+.type-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;padding:3px 8px;border-radius:20px;letter-spacing:.3px;text-transform:uppercase}
+.type-H{background:var(--blue-l);color:#1d4ed8}
+.type-F{background:var(--purple-l);color:var(--purple)}
+.type-M{background:var(--amber-l);color:var(--amber)}
+
+/* TROMBI */
+#view-trombi{padding:0 24px 40px}
+.house-block{margin-top:20px;border-radius:12px;overflow:hidden;border:1.5px solid var(--border)}
+.house-block-hdr{display:flex;align-items:center;gap:10px;padding:11px 16px;background:linear-gradient(135deg,var(--navy) 0%,var(--navy2) 100%);color:#fff}
+.hb-addr{font-size:12px;font-weight:700;flex:1;line-height:1.4}
+.hb-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.hb-num{display:flex;align-items:center;gap:4px;font-size:11px;font-weight:700}
+.dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.dot-g{background:var(--green)}.dot-r{background:var(--red)}
+.trombi-grid{background:#fff;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:10px}
+
+/* PERSON CARD */
+.pc{background:var(--light);border-radius:10px;padding:10px 6px;text-align:center;cursor:pointer;transition:all .18s;border:1.5px solid transparent}
+.pc:hover{border-color:var(--teal);transform:translateY(-2px);box-shadow:0 4px 12px rgba(42,127,127,.15)}
+.pc.out{opacity:.5;filter:grayscale(.7)}
+.pc-av{width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,var(--navy),var(--teal));color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;margin:0 auto 4px}
+.pc-name{font-size:10px;font-weight:700;line-height:1.2;margin-bottom:2px;word-break:break-word}
+.pc-meta{font-size:9px;color:var(--slate)}
+.pc-out-badge{font-size:8px;background:var(--red-l);color:var(--red);border-radius:4px;padding:1px 4px;margin-top:2px;display:inline-block;font-weight:700}
+.pc-add{background:transparent;border:1.5px dashed var(--border);border-radius:10px;padding:10px 6px;text-align:center;cursor:pointer;transition:all .18s}
+.pc-add:hover{border-color:var(--teal);background:var(--teal-l)}
+
+/* LOGEMENTS VIEW */
+#view-logements{padding:0 24px 40px;display:none}
+.log-row{background:#fff;border-radius:12px;border:1px solid var(--border);padding:14px 16px;margin-top:12px;display:grid;grid-template-columns:1fr auto 120px auto auto auto;gap:12px;align-items:center}
+.log-addr{display:flex;align-items:center;gap:10px}
+.log-bar-wrap{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.log-bar-fill{height:100%;border-radius:3px;transition:width .4s}
+
+/* MODAL */
+.modal-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:400;align-items:center;justify-content:center;padding:20px}
+.modal{background:#fff;border-radius:16px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 60px rgba(0,0,0,.25)}
+.mheader{padding:20px 24px 0;display:flex;justify-content:space-between;align-items:center}
+.mheader h3{font-size:16px;font-weight:800;color:var(--navy)}
+.mbody{padding:20px 24px}
+.mfooter{padding:16px 24px;display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--border)}
+.fg{margin-bottom:14px}
+.fl{font-size:11px;font-weight:700;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;display:block}
+.fi{width:100%;padding:9px 12px;border:1.5px solid var(--border);border-radius:9px;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s}
+.fi:focus{border-color:var(--teal)}
+
+/* PHOTO */
+.photo-z{border:2px dashed var(--border);border-radius:10px;padding:16px;text-align:center;cursor:pointer;transition:all .2s}
+.photo-z:hover{border-color:var(--teal);background:var(--teal-l)}
+.pz-ico{font-size:26px;margin-bottom:3px}.pz-txt{font-size:11px;color:var(--slate)}
+</style>
+</head>
+<body>
+
+<!-- ══ SETUP BANNER ══ -->
+<div id="setup-banner">
+  <div class="setup-box">
+    <h2>⚙️ Configuration Firebase requise</h2>
+    <p>Ce fichier est prêt à utiliser Firebase (base de données cloud temps réel). Il faut juste connecter votre projet Firebase en 3 étapes :</p>
+
+    <div class="setup-step">
+      <strong>Étape 1 — Créer un projet Firebase (gratuit)</strong><br>
+      Aller sur <a href="https://console.firebase.google.com" target="_blank">console.firebase.google.com</a> → <strong>+ Ajouter un projet</strong> → Donner un nom (ex: <code>cph-boucle-de-seine</code>) → Désactiver Google Analytics → Créer.
+    </div>
+
+    <div class="setup-step">
+      <strong>Étape 2 — Activer Firestore et Storage</strong><br>
+      Dans le menu gauche : <strong>Firestore Database</strong> → Créer base de données → Mode test → Sélectionner région <code>europe-west1</code>.<br>
+      Puis : <strong>Storage</strong> → Commencer → Mode test.
+    </div>
+
+    <div class="setup-step">
+      <strong>Étape 3 — Copier la configuration</strong><br>
+      ⚙️ Paramètres du projet → Vos applications → <strong>&lt;/&gt; Web</strong> → Enregistrer l'app → Copier le bloc <code>firebaseConfig</code> → Ouvrir ce fichier HTML avec un éditeur de texte → Remplacer les valeurs <code>VOTRE_...</code> dans la section CONFIG.
+    </div>
+
+    <div class="setup-step">
+      <strong>Étape 4 — Importer vos données existantes</strong><br>
+      Ouvrir votre ancien fichier HTML → <strong>Exporter JSON</strong> → Revenir ici → Cliquer <strong>📥 Importer JSON</strong>.
+    </div>
+
+    <p style="margin-top:16px;font-size:12px;color:#94a3b8">Ce message disparaîtra une fois la configuration correctement remplie.</p>
+  </div>
+</div>
+
+<!-- ══ HEADER ══ -->
+<header class="app-header">
+  <div class="hdr-brand">
+    <h1>CPH Boucle de Seine — Trombinoscope</h1>
+    <p>Groupe SOS Solidarité · Sartrouville</p>
+  </div>
+  <div class="hdr-actions">
+    <div id="cloud-indicator">
+      <div class="cloud-dot"></div>
+      <span>☁️ Temps réel</span>
+    </div>
+    <button class="btn btn-ghost" onclick="document.getElementById('json-import-input').click()">📥 Importer JSON</button>
+    <input type="file" id="json-import-input" accept=".json" style="display:none" onchange="importFromJSON(this)">
+    <button class="btn btn-primary" onclick="openAddHouse()">+ Logement</button>
+  </div>
+</header>
+
+<!-- ══ TABS ══ -->
+<div class="tabs">
+  <div class="tab active" id="tab-trombi" onclick="switchView('trombi')">👥 Trombinoscope</div>
+  <div class="tab" id="tab-logements" onclick="switchView('logements')">🏠 Logements</div>
+</div>
+
+<!-- ══ STATS ══ -->
+<div class="stats-row">
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#EFF6FF">🏠</div>
+    <div><div class="stat-val" id="s-houses">—</div><div class="stat-lbl">Logements</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#EAFAF1">✅</div>
+    <div>
+      <div class="stat-val" id="s-cap">—</div>
+      <div class="stat-lbl">Capacité totale</div>
+      <div class="cap-bar"><div class="cap-fill" id="s-cap-bar" style="width:0%"></div></div>
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#FDEDEC">👤</div>
+    <div><div class="stat-val" id="s-occ">—</div><div class="stat-lbl">Résidents</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#FFFBEB">🔑</div>
+    <div><div class="stat-val" id="s-avail">—</div><div class="stat-lbl">Places libres</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#EFF6FF">👨</div>
+    <div><div class="stat-val" id="s-h">—</div><div class="stat-lbl">Hommes</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#F5F3FF">👩</div>
+    <div><div class="stat-val" id="s-f">—</div><div class="stat-lbl">Femmes</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#FFFBEB">👨‍👩‍👧</div>
+    <div><div class="stat-val" id="s-m">—</div><div class="stat-lbl">Familles</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#EAFAF1">🧒</div>
+    <div><div class="stat-val" id="s-mineurs">—</div><div class="stat-lbl">Mineurs</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#FFFBEB">👴</div>
+    <div><div class="stat-val" id="s-seniors">—</div><div class="stat-lbl">Seniors +65</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-ico" style="background:#E6F4F4">📊</div>
+    <div><div class="stat-val" id="s-agemoy">—</div><div class="stat-lbl">Âge moyen</div></div>
+  </div>
+</div>
+
+<!-- Nationalités -->
+<div style="padding:12px 24px 0;display:flex;flex-wrap:wrap;gap:6px" id="s-nats"></div>
+
+<!-- ══ TOOLBAR ══ -->
+<div class="toolbar">
+  <div class="search-wrap">
+    <span class="search-ico">🔍</span>
+    <input type="text" id="search" placeholder="Rechercher résident, adresse, nationalité…" oninput="render()">
+  </div>
+  <select class="sel" id="f-status" onchange="render()">
+    <option value="">Tous statuts</option>
+    <option value="active">Résidents actifs</option>
+    <option value="out">Sortis</option>
+    <option value="mineur">Mineurs</option>
+    <option value="senior">Seniors +65</option>
+  </select>
+  <select class="sel" id="f-type" onchange="render()">
+    <option value="">Tous types</option>
+    <option value="H">👨 Hommes</option>
+    <option value="F">👩 Femmes</option>
+    <option value="M">👨‍👩‍👧 Familles</option>
+  </select>
+</div>
+
+<!-- ══ VIEWS ══ -->
+<div id="view-trombi" style="padding:0 24px 40px">
+  <div style="text-align:center;padding:60px;color:var(--slate)">
+    <div style="font-size:40px;margin-bottom:12px">☁️</div>
+    <div style="font-weight:700">Connexion à Firebase en cours…</div>
+    <div style="font-size:12px;margin-top:6px">Les données apparaîtront automatiquement</div>
+  </div>
+</div>
+<div id="view-logements" style="padding:0 24px 40px;display:none"></div>
+
+<!-- ══ MODAL LOGEMENT ══ -->
+<div class="modal-ov" id="modal-h" onclick="if(event.target===this)closeModal('modal-h')">
+  <div class="modal">
+    <div class="mheader">
+      <h3 id="mh-title">Logement</h3>
+      <button class="btn btn-cancel btn-icon" onclick="closeModal('modal-h')">✕</button>
+    </div>
+    <div class="mbody">
+      <div class="fg"><label class="fl">Adresse complète</label><input class="fi" id="h-addr" placeholder="Ex: 3 Allée de Gascogne, 78170 La Celle St Cloud"></div>
+      <div class="fg"><label class="fl">Ville</label><input class="fi" id="h-city" placeholder="Ex: Sartrouville"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="fg">
+          <label class="fl">Type de logement</label>
+          <select class="fi" id="h-type">
+            <option value="H">👨 Hommes</option>
+            <option value="F">👩 Femmes</option>
+            <option value="M">👨‍👩‍👧 Familles</option>
+          </select>
+        </div>
+        <div class="fg"><label class="fl">Chambres</label><input class="fi" id="h-rooms" type="number" value="2" min="1"></div>
+      </div>
+      <div class="fg">
+        <label class="fl">Capacité (places)</label>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:2px">
+          <button class="btn btn-cancel btn-sm btn-icon" style="font-size:18px;font-weight:800" onclick="adjCap(-1)">−</button>
+          <input class="fi" id="h-cap" type="number" value="4" min="1" style="text-align:center;font-size:18px;font-weight:800;max-width:80px">
+          <button class="btn btn-primary btn-sm btn-icon" style="font-size:18px;font-weight:800" onclick="adjCap(1)">＋</button>
+          <span id="h-cap-total" style="font-size:11px;color:var(--slate);font-weight:600"></span>
+        </div>
+      </div>
+    </div>
+    <div class="mfooter">
+      <button class="btn btn-danger btn-sm" id="mh-del" onclick="deleteHouse()" style="display:none;margin-right:auto">🗑 Supprimer</button>
+      <button class="btn btn-cancel btn-sm" onclick="closeModal('modal-h')">Annuler</button>
+      <button class="btn btn-primary btn-sm" onclick="saveHouse()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL RÉSIDENT ══ -->
+<div class="modal-ov" id="modal-p" onclick="if(event.target===this)closeModal('modal-p')">
+  <div class="modal">
+    <div class="mheader">
+      <h3 id="mp-title">Résident</h3>
+      <button class="btn btn-cancel btn-icon" onclick="closeModal('modal-p')">✕</button>
+    </div>
+    <div class="mbody">
+      <!-- Photo -->
+      <div class="fg">
+        <label class="fl">Photo</label>
+        <div class="photo-z" onclick="document.getElementById('pz-inp').click()">
+          <img id="pz-img" style="width:56px;height:56px;border-radius:50%;object-fit:cover;margin:0 auto 6px;display:none">
+          <div id="pz-ph">
+            <div class="pz-ico">📷</div>
+            <div class="pz-txt">Cliquer pour ajouter une photo</div>
+          </div>
+        </div>
+        <input type="file" id="pz-inp" accept="image/*" onchange="handlePhoto(this)" style="display:none">
+      </div>
+
+      <div class="fg"><label class="fl">Nom complet</label><input class="fi" id="p-name" placeholder="Ex: Ali HASSAN HADAFOW"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="fg">
+          <label class="fl">Rôle</label>
+          <select class="fi" id="p-role">
+            <option>Résident</option><option>Résidente</option>
+            <option>Chef de famille</option><option>Cheffe de famille</option>
+          </select>
+        </div>
+        <div class="fg"><label class="fl">Âge</label><input class="fi" id="p-age" type="number" min="0" max="120" placeholder="30"></div>
+      </div>
+      <div class="fg"><label class="fl">Nationalité</label><input class="fi" id="p-nat" placeholder="Ex: Afghane"></div>
+      <div class="fg">
+        <label class="fl">Logement</label>
+        <select class="fi" id="p-hid"><option value="">— Choisir —</option></select>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="fg"><label class="fl">Date d'entrée</label><input class="fi" id="p-entry" type="date"></div>
+        <div class="fg"><label class="fl">Date de sortie</label><input class="fi" id="p-exit" type="date"></div>
+      </div>
+    </div>
+    <div class="mfooter">
+      <button class="btn btn-danger btn-sm" id="mp-del" onclick="deletePerson()" style="display:none;margin-right:auto">🗑 Supprimer</button>
+      <button class="btn btn-cancel btn-sm" onclick="closeModal('modal-p')">Annuler</button>
+      <button class="btn btn-primary btn-sm" onclick="savePerson()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<!-- SYNC BADGE -->
+<div id="sync-badge">✅ Synchro</div>
+
+</body>
+</html>
